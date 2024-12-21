@@ -3,7 +3,7 @@
 use core::array;
 
 use bevy_asset::{AssetId, Handle};
-use bevy_color::ColorToComponents as _;
+use bevy_color::{ColorToComponents as _, Gray, LinearRgba};
 use bevy_core_pipeline::{
     core_3d::Camera3d,
     prepass::{DeferredPrepass, DepthPrepass, MotionVectorPrepass, NormalPrepass},
@@ -12,13 +12,15 @@ use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
     component::Component,
     entity::Entity,
-    query::{Has, QueryItem, With},
+    query::{Has, QueryData, QueryItem, With},
     system::{lifetimeless::Read, Commands, Local, Query, Res, ResMut, Resource},
     world::{FromWorld, World},
 };
 use bevy_image::{BevyDefault, Image};
-use bevy_math::{vec4, Mat3A, Mat4, Vec3, Vec3A, Vec4, Vec4Swizzles as _};
+use bevy_math::{vec4, Mat3A, Mat4, UVec2, Vec3, Vec3A, Vec4, Vec4Swizzles as _};
 use bevy_render::{
+    camera::ExtractedCamera,
+    extract_component::{ComponentUniforms, DynamicUniformIndex},
     mesh::{
         allocator::MeshAllocator, Mesh, MeshVertexBufferLayoutRef, RenderMesh, RenderMeshBufferInfo,
     },
@@ -30,15 +32,16 @@ use bevy_render::{
         },
         BindGroupLayout, BindGroupLayoutEntries, BindingResource, BlendComponent, BlendFactor,
         BlendOperation, BlendState, CachedRenderPipelineId, ColorTargetState, ColorWrites,
-        DynamicBindGroupEntries, DynamicUniformBuffer, Face, FragmentState, LoadOp,
+        DynamicBindGroupEntries, DynamicUniformBuffer, Extent3d, Face, FragmentState, LoadOp,
         MultisampleState, Operations, PipelineCache, PrimitiveState, RenderPassColorAttachment,
         RenderPassDescriptor, RenderPipelineDescriptor, SamplerBindingType, Shader, ShaderStages,
-        ShaderType, SpecializedRenderPipeline, SpecializedRenderPipelines, StoreOp, TextureFormat,
-        TextureSampleType, TextureUsages, VertexState,
+        ShaderType, SpecializedRenderPipeline, SpecializedRenderPipelines, StoreOp,
+        TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
+        TextureView, TextureViewDescriptor, VertexState,
     },
     renderer::{RenderContext, RenderDevice, RenderQueue},
     sync_world::RenderEntity,
-    texture::GpuImage,
+    texture::{CachedTexture, GpuImage, TextureCache},
     view::{ExtractedView, Msaa, ViewDepthTexture, ViewTarget, ViewUniformOffset},
     Extract,
 };
@@ -52,6 +55,8 @@ use crate::{
     ViewLightsUniformOffset, ViewScreenSpaceReflectionsUniformOffset, VolumetricFog,
     VolumetricLight,
 };
+
+use super::upsampling_pipeline::{UpsamplingBindGroup, UpsamplingPipelineIds, UpsamplingUniforms};
 
 bitflags! {
     /// Flags that describe the bind group layout used to render volumetric fog.
@@ -132,6 +137,21 @@ pub struct ViewVolumetricFogPipelines {
     pub textured: CachedRenderPipelineId,
 }
 
+#[derive(Component)]
+pub struct VolumetricFogTexture {
+    texture: CachedTexture,
+}
+
+impl VolumetricFogTexture {
+    pub fn view(&self) -> TextureView {
+        self.texture.texture.create_view(&TextureViewDescriptor {
+            base_mip_level: 0,
+            mip_level_count: Some(1u32),
+            ..Default::default()
+        })
+    }
+}
+
 /// The node in the render graph, part of the postprocessing stack, that
 /// implements volumetric fog.
 #[derive(Default)]
@@ -178,6 +198,7 @@ pub struct VolumetricFogUniform {
     ambient_color: Vec3,
     ambient_intensity: f32,
     step_count: u32,
+    resolution_factor: u32,
 
     /// The radius of a sphere that bounds the fog volume in view space.
     bounding_radius: f32,
@@ -312,30 +333,44 @@ pub fn extract_volumetric_fog(
     }
 }
 
+#[derive(QueryData)]
+pub struct VolumetricFogNodeViewQuery {
+    view_target: Read<ViewTarget>,
+    view_depth_texture: Read<ViewDepthTexture>,
+    view_volumetric_lighting_pipelines: Read<ViewVolumetricFogPipelines>,
+    volumetric_fog_textures: Read<VolumetricFogTexture>,
+    upsampling_bind_group: Read<UpsamplingBindGroup>,
+    uniform_index: Read<DynamicUniformIndex<UpsamplingUniforms>>,
+    upsampling_pipeline_ids: Read<UpsamplingPipelineIds>,
+    view_uniform_offset: Read<ViewUniformOffset>,
+    view_lights_offset: Read<ViewLightsUniformOffset>,
+    view_fog_offset: Read<ViewFogUniformOffset>,
+    view_light_probes_offset: Read<ViewLightProbesUniformOffset>,
+    view_fog_volumes: Read<ViewVolumetricFog>,
+    view_bind_group: Read<MeshViewBindGroup>,
+    view_ssr_offset: Read<ViewScreenSpaceReflectionsUniformOffset>,
+    msaa: Read<Msaa>,
+    view_environment_map_offset: Read<ViewEnvironmentMapUniformOffset>,
+}
+
 impl ViewNode for VolumetricFogNode {
-    type ViewQuery = (
-        Read<ViewTarget>,
-        Read<ViewDepthTexture>,
-        Read<ViewVolumetricFogPipelines>,
-        Read<ViewUniformOffset>,
-        Read<ViewLightsUniformOffset>,
-        Read<ViewFogUniformOffset>,
-        Read<ViewLightProbesUniformOffset>,
-        Read<ViewVolumetricFog>,
-        Read<MeshViewBindGroup>,
-        Read<ViewScreenSpaceReflectionsUniformOffset>,
-        Read<Msaa>,
-        Read<ViewEnvironmentMapUniformOffset>,
-    );
+    type ViewQuery = VolumetricFogNodeViewQuery;
 
     fn run<'w>(
         &self,
         _: &mut RenderGraphContext,
         render_context: &mut RenderContext<'w>,
-        (
+        query_item: QueryItem<'w, Self::ViewQuery>,
+        world: &'w World,
+    ) -> Result<(), NodeRunError> {
+        let VolumetricFogNodeViewQueryItem {
             view_target,
             view_depth_texture,
             view_volumetric_lighting_pipelines,
+            volumetric_fog_textures,
+            upsampling_bind_group,
+            uniform_index,
+            upsampling_pipeline_ids,
             view_uniform_offset,
             view_lights_offset,
             view_fog_offset,
@@ -345,23 +380,27 @@ impl ViewNode for VolumetricFogNode {
             view_ssr_offset,
             msaa,
             view_environment_map_offset,
-        ): QueryItem<'w, Self::ViewQuery>,
-        world: &'w World,
-    ) -> Result<(), NodeRunError> {
+        } = query_item;
         let pipeline_cache = world.resource::<PipelineCache>();
         let volumetric_lighting_pipeline = world.resource::<VolumetricFogPipeline>();
         let volumetric_lighting_uniform_buffers = world.resource::<VolumetricFogUniformBuffer>();
         let image_assets = world.resource::<RenderAssets<GpuImage>>();
         let mesh_allocator = world.resource::<MeshAllocator>();
 
+        let uniforms = world.resource::<ComponentUniforms<UpsamplingUniforms>>();
+
         // Fetch the uniform buffer and binding.
         let (
+            Some(uniforms),
             Some(textureless_pipeline),
             Some(textured_pipeline),
+            Some(upsampling_pipeline),
             Some(volumetric_lighting_uniform_buffer_binding),
         ) = (
+            uniforms.binding(),
             pipeline_cache.get_render_pipeline(view_volumetric_lighting_pipelines.textureless),
             pipeline_cache.get_render_pipeline(view_volumetric_lighting_pipelines.textured),
+            pipeline_cache.get_render_pipeline(upsampling_pipeline_ids.id_final),
             volumetric_lighting_uniform_buffers.binding(),
         )
         else {
@@ -435,11 +474,13 @@ impl ViewNode for VolumetricFogNode {
                 volumetric_view_bind_group_layout,
                 &bind_group_entries,
             );
+            let view = &volumetric_fog_textures.view();
 
             let render_pass_descriptor = RenderPassDescriptor {
                 label: Some("volumetric lighting pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
-                    view: view_target.main_texture_view(),
+                    // view: view_target.main_texture_view(),
+                    view,
                     resolve_target: None,
                     ops: Operations {
                         load: LoadOp::Load,
@@ -499,6 +540,29 @@ impl ViewNode for VolumetricFogNode {
                     render_pass.draw(vertex_buffer_slice.range, 0..1);
                 }
             }
+        }
+        {
+            let mut upsampling_final_pass =
+                render_context.begin_tracked_render_pass(RenderPassDescriptor {
+                    label: Some("volumetric_fog_upsampling_pass"),
+                    color_attachments: &[Some(view_target.get_unsampled_color_attachment())],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+            upsampling_final_pass.set_render_pipeline(upsampling_pipeline);
+            upsampling_final_pass.set_bind_group(
+                0,
+                &upsampling_bind_group.upsampling_bind_group,
+                &[uniform_index.index()],
+            );
+            // if let Some(viewport) = camera.viewport.as_ref() {
+            //     upsampling_final_pass.set_camera_viewport(viewport);
+            // }
+            let blend = 0.5; // TODO: fix blending
+            // compute_blend_factor(bloom_settings, 0.0, (bloom_texture.mip_count - 1) as f32);
+            upsampling_final_pass.set_blend_constant(LinearRgba::gray(blend));
+            upsampling_final_pass.draw(0..3, 0..1);
         }
 
         Ok(())
@@ -602,6 +666,47 @@ impl SpecializedRenderPipeline for VolumetricFogPipeline {
                 })],
             }),
             zero_initialize_workgroup_memory: false,
+        }
+    }
+}
+
+pub const FOG_TEXTURE_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
+
+// TODO: move to upsampling?
+pub fn prepare_fog_textures(
+    mut commands: Commands,
+    mut texture_cache: ResMut<TextureCache>,
+    render_device: Res<RenderDevice>,
+    views: Query<(Entity, &ExtractedCamera, &VolumetricFog)>,
+) {
+    for (entity, camera, fog) in &views {
+        if let Some(UVec2 {
+            x: width,
+            y: height,
+        }) = camera.physical_viewport_size
+        {
+            let texture_descriptor = TextureDescriptor {
+                label: Some("fog_texture"),
+                size: Extent3d {
+                    width: ((width as f32 / fog.resolution_factor.get() as f32).round() as u32)
+                        .max(1),
+                    height: ((height as f32 / fog.resolution_factor.get() as f32).round() as u32)
+                        .max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: FOG_TEXTURE_FORMAT,
+                usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            };
+
+            let texture = texture_cache.get(&render_device, texture_descriptor);
+
+            commands
+                .entity(entity)
+                .insert(VolumetricFogTexture { texture });
         }
     }
 }
@@ -741,6 +846,7 @@ pub fn prepare_volumetric_fog_uniforms(
                 ambient_color: volumetric_fog.ambient_color.to_linear().to_vec3(),
                 ambient_intensity: volumetric_fog.ambient_intensity,
                 step_count: volumetric_fog.step_count,
+                resolution_factor: volumetric_fog.resolution_factor.get(),
                 bounding_radius,
                 absorption: fog_volume.absorption,
                 scattering: fog_volume.scattering,
