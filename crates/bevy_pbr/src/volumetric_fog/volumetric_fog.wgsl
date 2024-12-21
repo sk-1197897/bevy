@@ -52,6 +52,7 @@ struct VolumetricFog {
     ambient_color: vec3<f32>,
     ambient_intensity: f32,
     step_count: u32,
+    resolution_factor: u32,
     bounding_radius: f32,
     absorption: f32,
     scattering: f32,
@@ -126,10 +127,10 @@ fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     // Sample the depth to put an upper bound on the length of the ray (as we
     // shouldn't trace through solid objects). If this is multisample, just use
     // sample 0; this is approximate but good enough.
-    let frag_coord = position;
+    let frag_coord = position * f32(volumetric_fog.resolution_factor);
     let ndc_end_depth_from_buffer = textureLoad(depth_texture, vec2<i32>(frag_coord.xy), 0);
     let view_end_depth_from_buffer = -position_ndc_to_view(
-        frag_coord_to_ndc(vec4(position.xy, ndc_end_depth_from_buffer, 1.0))).z;
+        frag_coord_to_ndc(vec4(frag_coord.xy, ndc_end_depth_from_buffer, 1.0))).z;
 
     // Calculate the start position of the ray. Since we're only rendering front
     // faces of the AABB, this is the current fragment's depth.
@@ -178,13 +179,13 @@ fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
 
     // Calculate the ray origin (`Ro`) and the ray direction (`Rd`) in NDC,
     // view, and world coordinates.
-    let Rd_ndc = vec3(frag_coord_to_ndc(position).xy, 1.0);
+    let Rd_ndc = vec3(frag_coord_to_ndc(frag_coord).xy, 1.0);
     let Rd_view = normalize(position_ndc_to_view(Rd_ndc));
     var Ro_world = position_view_to_world(view_start_pos.xyz);
     let Rd_world = normalize(position_ndc_to_world(Rd_ndc) - view.world_position);
 
     // Offset by jitter.
-    let jitter = interleaved_gradient_noise(position.xy, globals.frame_count) * jitter_strength;
+    let jitter = interleaved_gradient_noise(frag_coord.xy, globals.frame_count) * jitter_strength;
     Ro_world += Rd_world * jitter;
 
     // Use Beer's law [1] [2] to calculate the maximum amount of light that each
