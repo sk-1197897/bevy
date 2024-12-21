@@ -31,6 +31,8 @@
 
 #![expect(deprecated)]
 
+use std::num::NonZero;
+
 use bevy_app::{App, Plugin};
 use bevy_asset::{load_internal_asset, Assets, Handle};
 use bevy_color::Color;
@@ -51,22 +53,19 @@ use bevy_math::{
 };
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{
-    mesh::{Mesh, Meshable},
-    render_graph::{RenderGraphApp, ViewNodeRunner},
-    render_resource::{Shader, SpecializedRenderPipelines},
-    sync_component::SyncComponentPlugin,
-    view::{InheritedVisibility, ViewVisibility, Visibility},
-    ExtractSchedule, Render, RenderApp, RenderSet,
+    extract_component::{ExtractComponentPlugin, UniformComponentPlugin}, mesh::{Mesh, Meshable}, render_graph::{RenderGraphApp, ViewNodeRunner}, render_resource::{Shader, SpecializedRenderPipelines}, sync_component::SyncComponentPlugin, view::{InheritedVisibility, ViewVisibility, Visibility}, ExtractSchedule, Render, RenderApp, RenderSet
 };
 use bevy_transform::components::{GlobalTransform, Transform};
 use render::{
     VolumetricFogNode, VolumetricFogPipeline, VolumetricFogUniformBuffer, CUBE_MESH, PLANE_MESH,
     VOLUMETRIC_FOG_HANDLE,
 };
+use upsampling_pipeline::{UpsamplingPipeline, UpsamplingUniforms};
 
 use crate::graph::NodePbr;
 
 pub mod render;
+pub mod upsampling_pipeline;
 
 /// A plugin that implements volumetric fog.
 pub struct VolumetricFogPlugin;
@@ -118,6 +117,13 @@ pub struct VolumetricFog {
     ///
     /// The default value is 64.
     pub step_count: u32,
+
+    /// Factor to divide the fog texture resolution by.
+    /// Larger values will result in higher performance, but lower fidelity of the fog.
+    /// Recommended values are 1, 2 or 4.
+    ///
+    /// The default is 1 (full resolution)
+    pub resolution_factor: NonZero<u32>,
 }
 
 #[deprecated(since = "0.15.0", note = "Renamed to `VolumetricFog`")]
@@ -220,6 +226,7 @@ pub struct FogVolume {
 
 impl Plugin for VolumetricFogPlugin {
     fn build(&self, app: &mut App) {
+        load_internal_asset!(app, upsampling_pipeline::FOG_UPSCALING_SHADER_HANDLE, "upsample.wgsl", Shader::from_wgsl);
         load_internal_asset!(
             app,
             VOLUMETRIC_FOG_HANDLE,
@@ -234,7 +241,12 @@ impl Plugin for VolumetricFogPlugin {
         app.register_type::<VolumetricFog>()
             .register_type::<VolumetricLight>();
 
-        app.add_plugins(SyncComponentPlugin::<FogVolume>::default());
+        app.add_plugins((
+            SyncComponentPlugin::<FogVolume>::default(),
+            ExtractComponentPlugin::<VolumetricFog>::default(),
+            UniformComponentPlugin::<UpsamplingUniforms>::default(),
+        ));
+
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -242,11 +254,15 @@ impl Plugin for VolumetricFogPlugin {
 
         render_app
             .init_resource::<SpecializedRenderPipelines<VolumetricFogPipeline>>()
+            .init_resource::<SpecializedRenderPipelines<UpsamplingPipeline>>()
             .init_resource::<VolumetricFogUniformBuffer>()
             .add_systems(ExtractSchedule, render::extract_volumetric_fog)
             .add_systems(
                 Render,
                 (
+                    upsampling_pipeline::prepare_upsampling_pipeline.in_set(RenderSet::Prepare),
+                    render::prepare_fog_textures.in_set(RenderSet::PrepareResources),
+                    upsampling_pipeline::prepare_upsampling_bind_groups.in_set(RenderSet::PrepareBindGroups),
                     render::prepare_volumetric_fog_pipelines.in_set(RenderSet::Prepare),
                     render::prepare_volumetric_fog_uniforms.in_set(RenderSet::Prepare),
                     render::prepare_view_depth_textures_for_volumetric_fog
@@ -263,6 +279,7 @@ impl Plugin for VolumetricFogPlugin {
 
         render_app
             .init_resource::<VolumetricFogPipeline>()
+            .init_resource::<UpsamplingPipeline>()
             .add_render_graph_node::<ViewNodeRunner<VolumetricFogNode>>(
                 Core3d,
                 NodePbr::VolumetricFog,
@@ -284,6 +301,7 @@ impl Default for VolumetricFog {
             ambient_color: Color::WHITE,
             ambient_intensity: 0.1,
             jitter: 0.0,
+            resolution_factor: NonZero::new(2).unwrap(),
         }
     }
 }
