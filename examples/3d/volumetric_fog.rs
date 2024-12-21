@@ -1,5 +1,7 @@
 //! Demonstrates volumetric fog and lighting (light shafts or god rays).
 
+use std::num::NonZero;
+
 use bevy::{
     color::palettes::css::RED,
     core_pipeline::{bloom::Bloom, tonemapping::Tonemapping, Skybox},
@@ -38,18 +40,32 @@ struct MoveBackAndForthHorizontally {
 
 fn main() {
     App::new()
-        .add_plugins(DefaultPlugins)
+        .add_plugins(DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                present_mode: bevy::window::PresentMode::Immediate,
+                ..default()
+            }),
+            ..default()
+        }))
         .insert_resource(ClearColor(Color::Srgba(Srgba {
             red: 0.02,
             green: 0.02,
             blue: 0.02,
             alpha: 1.0,
         })))
+        .insert_resource(FogSettingsChanged(false))
         .insert_resource(AmbientLight::NONE)
         .init_resource::<AppSettings>()
         .add_systems(Startup, setup)
         .add_systems(Update, tweak_scene)
-        .add_systems(Update, (move_directional_light, move_point_light))
+        .add_systems(
+            Update,
+            (
+                move_directional_light,
+                move_point_light,
+                change_fog_settings,
+            ),
+        )
         .add_systems(Update, adjust_app_settings)
         .run();
 }
@@ -61,6 +77,11 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, app_settings: R
         GltfAssetLabel::Scene(0).from_asset("models/VolumetricFogExample/VolumetricFogExample.glb"),
     )));
 
+    let fog = VolumetricFog {
+        // This value is explicitly set to 0 since we have no environment map light
+        ambient_intensity: 0.0,
+        ..default()
+    };
     // Spawn the camera.
     commands
         .spawn((
@@ -78,11 +99,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, app_settings: R
             brightness: 1000.0,
             ..default()
         })
-        .insert(VolumetricFog {
-            // This value is explicitly set to 0 since we have no environment map light
-            ambient_intensity: 0.0,
-            ..default()
-        });
+        .insert(fog);
 
     // Add the point light
     commands.spawn((
@@ -124,7 +141,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, app_settings: R
 
     // Add the help text.
     commands.spawn((
-        create_text(&app_settings),
+        create_text(&app_settings, &fog),
         Node {
             position_type: PositionType::Absolute,
             top: Val::Px(12.0),
@@ -134,9 +151,9 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, app_settings: R
     ));
 }
 
-fn create_text(app_settings: &AppSettings) -> Text {
+fn create_text(app_settings: &AppSettings, fog: &VolumetricFog) -> Text {
     format!(
-        "{}\n{}\n{}",
+        "{}\n{}\n{}\n{}{}\n{}{}",
         "Press WASD or the arrow keys to change the direction of the directional light",
         if app_settings.volumetric_pointlight {
             "Press P to turn volumetric point light off"
@@ -147,7 +164,11 @@ fn create_text(app_settings: &AppSettings) -> Text {
             "Press L to turn volumetric spot light off"
         } else {
             "Press L to turn volumetric spot light on"
-        }
+        },
+        "Current resolution factor: ",
+        fog.resolution_factor,
+        "Current step_count: ",
+        fog.step_count,
     )
     .into()
 }
@@ -194,6 +215,53 @@ fn move_directional_light(
     }
 }
 
+#[derive(Resource)]
+struct FogSettingsChanged(bool);
+
+fn change_fog_settings(
+    input: Res<ButtonInput<KeyCode>>,
+    mut fogs: Query<&mut VolumetricFog, With<Camera>>,
+    mut fog_settings_changed: ResMut<FogSettingsChanged>,
+) {
+    let mut new_factor = None;
+    let mut factor = 1;
+    let mut changed = false;
+    for key_code in [
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        KeyCode::Digit8,
+        KeyCode::Digit9,
+    ] {
+        if input.just_pressed(key_code) {
+            new_factor = Some(factor);
+        }
+        factor *= 2;
+    }
+
+    let change_steps = input.pressed(KeyCode::ShiftLeft);
+    if let Some(factor) = new_factor {
+        for mut fog in fogs.iter_mut() {
+            if change_steps {
+                let step_count = 64 * factor;
+                info!("Changing step_count to {step_count}");
+                fog.step_count = step_count;
+                changed = true;
+            } else {
+                info!("Changing resolution factor to {factor}");
+                fog.resolution_factor = NonZero::new(factor).unwrap();
+                changed = true;
+            }
+        }
+    }
+
+    fog_settings_changed.0 = changed;
+}
+
 // Toggle point light movement between left and right.
 fn move_point_light(
     timer: Res<Time>,
@@ -224,11 +292,13 @@ fn adjust_app_settings(
     mut app_settings: ResMut<AppSettings>,
     mut point_lights: Query<Entity, With<PointLight>>,
     mut spot_lights: Query<Entity, With<SpotLight>>,
+    fog: Query<&VolumetricFog, With<Camera>>,
+    fog_settings_changed: Res<FogSettingsChanged>,
     mut text: Query<&mut Text>,
 ) {
     // If there are no changes, we're going to bail for efficiency. Record that
     // here.
-    let mut any_changes = false;
+    let mut any_changes = fog_settings_changed.0;
 
     // If the user pressed P, toggle volumetric state of the point light.
     if keyboard_input.just_pressed(KeyCode::KeyP) {
@@ -264,6 +334,6 @@ fn adjust_app_settings(
 
     // Update the help text.
     for mut text in text.iter_mut() {
-        *text = create_text(&app_settings);
+        *text = create_text(&app_settings, &fog.single());
     }
 }
